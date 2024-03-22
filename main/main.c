@@ -20,6 +20,102 @@ const uint LED_1_OLED = 20;
 const uint LED_2_OLED = 21;
 const uint LED_3_OLED = 22;
 
+const int TRIG_PIN = 13;
+const int ECHO_PIN = 12;
+
+QueueHandle_t xQueueTime;
+QueueHandle_t xQueueDistance;
+
+SemaphoreHandle_t xSemaphoreTrigger;
+
+typedef struct {
+    uint32_t event;
+    int time;
+} event_t;
+
+void pin_callback(uint gpio, uint32_t events) {
+    event_t evt;
+    evt.event = events;
+    evt.time = to_us_since_boot(get_absolute_time());
+    xQueueSendToBackFromISR(xQueueTime, &evt, 0);
+}
+
+void echo_task(void *p) {
+    gpio_init(ECHO_PIN);
+    gpio_set_dir(ECHO_PIN, GPIO_IN);
+    gpio_set_irq_enabled_with_callback(ECHO_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &pin_callback);
+
+    event_t evt;
+    int time_start = 0;
+    int time_end;
+
+    int time_diff;
+    int distance;
+
+    while (1) {
+        if (xQueueReceive(xQueueTime, &evt, pdMS_TO_TICKS(1000))) {
+            if (evt.event == 0x8) {
+                time_start = evt.time;
+            } else if (evt.event == 0x4){
+                time_end = evt.time;
+                time_diff = time_end - time_start;
+                distance = time_diff / 58;
+                xQueueSendToBack(xQueueDistance, &distance, 0);
+            }
+        } else {
+            distance = 99999;
+            xQueueSendToBack(xQueueDistance, &distance, 0);
+        }
+    }
+}
+
+void oled_task(void *p) {
+    printf("Inicializando Driver\n");
+    ssd1306_init();
+
+    printf("Inicializando GLX\n");
+    ssd1306_t disp;
+    gfx_init(&disp, 128, 32);
+
+    printf("Inicializando btn and LEDs\n");
+    oled1_btn_led_init();
+
+    int distance = 0;
+    char buffer[20];
+
+    while (1) {
+        if (xSemaphoreTake(xSemaphoreTrigger, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (xQueueReceive(xQueueDistance, &distance, pdMS_TO_TICKS(100))) {
+                gfx_clear_buffer(&disp);
+                if (distance > 300){
+                    gfx_draw_string(&disp, 0, 0, 1, "ERROR");
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+                else{
+                    sprintf(buffer, "Distance: %d cm", distance);
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    gfx_draw_string(&disp, 0, 0, 1, buffer);
+                    gfx_draw_line(&disp, 0, 15, distance, 15);
+                }
+                gfx_show(&disp);
+            }
+        }
+    }
+}
+
+void trigger_task(void *p) {
+    gpio_init(TRIG_PIN);
+    gpio_set_dir(TRIG_PIN, GPIO_OUT);
+
+    while (1) {
+        xSemaphoreGive(xSemaphoreTrigger);
+        gpio_put(TRIG_PIN, 1);
+        sleep_us(10);
+        gpio_put(TRIG_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 void oled1_btn_led_init(void) {
     gpio_init(LED_1_OLED);
     gpio_set_dir(LED_1_OLED, GPIO_OUT);
@@ -127,7 +223,14 @@ void oled1_demo_2(void *p) {
 int main() {
     stdio_init_all();
 
-    xTaskCreate(oled1_demo_2, "Demo 2", 4095, NULL, 1, NULL);
+    xQueueTime = xQueueCreate(32, sizeof(event_t));
+    xQueueDistance = xQueueCreate(32, sizeof(uint32_t));
+
+    xSemaphoreTrigger = xSemaphoreCreateBinary();
+    
+    xTaskCreate(trigger_task, "trigger_task", 2048, NULL, 1, NULL);
+    xTaskCreate(echo_task, "echo_task", 2048, NULL, 1, NULL);
+    xTaskCreate(oled_task, "oled_task", 2048, NULL, 1, NULL);
 
     vTaskStartScheduler();
 
